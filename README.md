@@ -858,6 +858,7 @@ Inspect `zb` and `msk` in `sfincs_map.nc` immediately after the first run. This 
 - Bates, P. D., Horritt, M. S., and Fewtrell, T. J. (2010). A simple inertial formulation of the shallow water equations for efficient two-dimensional flood inundation modelling. *Journal of Hydrology*. <https://doi.org/10.1016/j.jhydrol.2010.03.027>
 - Van Ormondt et al. (2025). Subgrid corrections for the linear inertial equations of a compound flood model. *Geoscientific Model Development*. <https://doi.org/10.5194/gmd-18-843-2025>
 - SFINCS manual in this repository: `docs/overview.rst`, `docs/input.rst`, `docs/input_forcing.rst`, `docs/parameters.rst`, and `docs/output.rst`.
+- SnapWave equations technical note (this branch): `docs/snapwave_wave_model_equations.tex` — source-derived wave-balance equations, coupling details, and comparison with Boussinesq and spectral wave models.
 - HydroMT-SFINCS: <https://deltares.github.io/hydromt_sfincs/latest/>
 - NOAA CO-OPS data API: <https://api.tidesandcurrents.noaa.gov/api/prod>
 - NOAA NDBC observation descriptions: <https://www.ndbc.noaa.gov/obsdes.shtml>

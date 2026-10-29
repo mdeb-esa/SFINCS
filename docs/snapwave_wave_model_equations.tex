@@ -1,0 +1,588 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{microtype}
+
+\newcommand{\ee}{E_\theta}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{The SnapWave wave model coupled to SFINCS:\\[2pt]
+\large Governing equations as implemented in the source code,\\
+and comparison with Boussinesq and spectral wave models}
+\author{Technical note based on a source-code review of\\
+\texttt{SFINCS/source/src/snapwave/} and \texttt{sfincs\_snapwave.f90}\\
+(checkout \texttt{cline/f61jy65y}, SFINCS v2.4.0 Galibier+)}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This note documents the wave-model equations actually implemented in SnapWave,
+the stationary wave solver embedded in SFINCS, as read directly from the Fortran
+source code. We derive the governing balance equations, list every source and
+sink term with its parameters and code defaults, describe the numerical scheme
+and the two-way coupling with the SFINCS hydrodynamics, and then compare the
+formulation with phase-resolving Boussinesq-type models and full spectral wave
+models (SWAN/XBeach-style action balance). The goal is to provide a precise
+reference for diagnosing unexpected behaviour in coupled SFINCS--SnapWave
+simulations.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Model context and overall structure}
+
+SnapWave is a \emph{stationary}, \emph{phase-averaged}, \emph{directionally
+resolved} wave model. It does not resolve individual wave phases or the full
+frequency spectrum. Instead, at each node $k$ of an unstructured mesh it
+carries a one-dimensional directional distribution of wave energy density
+$\ee(\theta,k)$ (units J\,m$^{-2}$\,rad$^{-1}$) at a single representative
+frequency $\sigma(k) = 2\pi/T_p(k)$ per wave system. Two wave systems are
+solved separately:
+
+\begin{itemize}
+  \item \textbf{Incident (short) waves}: energy $\ee$, height $H$, period $T_p$.
+  \item \textbf{Infragravity (IG) waves}: energy $E_{\theta,ig}$, height $H_{ig}$,
+  period $T_{p,ig}$, with their own wavenumber, group velocity, refraction speed
+  and dissipation terms (suffix \code{\_ig} in the code).
+\end{itemize}
+
+The solver is called from SFINCS every \code{dtwave} seconds (default 3600\,s)
+through \code{sfincs\_snapwave.f90::update\_wave\_field}. Before each call,
+SFINCS water levels $\zeta$ are mapped onto the SnapWave mesh so that the wave
+model uses the instantaneous depth $h = \max(\zeta - z_b,\,10^{-5}\,\mathrm{m})$.
+After the call, wave heights, periods and depth-integrated wave forces are
+mapped back onto the SFINCS grid and added to the momentum equation. SnapWave
+itself is stationary: time enters only through the boundary conditions and the
+slowly varying water depth, and a pseudo-time term is used purely as an
+iteration device (Section~\ref{sec:numerics}).
+
+\section{Governing equation: the stationary directional energy balance}
+\label{sec:governing}
+
+\subsection{Continuous form}
+
+The core equation, implemented in
+\code{snapwave\_solver.f90::solve\_energy\_balance2Dstat}, is a stationary,
+directionally resolved wave-energy balance at representative frequency
+$\sigma$:
+
+\begin{equation}
+\underbrace{\frac{\partial \ee}{\partial t^{*}}}_{\text{pseudo-time}}
++\underbrace{c_g\,\frac{\partial \ee}{\partial s}}_{\text{propagation}}
++\underbrace{\frac{\partial}{\partial \theta}\!\left(c_\theta\,\ee\right)}_{\text{refraction}}
+=
+-\underbrace{\frac{D_{w}+D_{f}+D_{veg}}{E}\,\ee}_{\text{dissipation}}
++\underbrace{S_{\mathrm{wind}}}_{\text{optional}}
+\;\mp\;
+\underbrace{S_{ig}}_{\substack{\text{incident--IG}\\\text{exchange}}},
+\label{eq:energybalance}
+\end{equation}
+
+where $\ee(\theta)$ is the directionally resolved wave-energy density
+(J\,m$^{-2}$\,rad$^{-1}$), $s$ is the along-ray coordinate, $c_g$ the group
+velocity, $c_\theta$ the refraction (direction-turning) speed, and
+$D_w,D_f,D_{veg}$ the breaking, bottom-friction and vegetation dissipation
+rates (W\,m$^{-2}$). The total energy is
+\begin{equation}
+E=\int_{\theta}\ee\,\dd\theta,\qquad
+H=\sqrt{\frac{8E}{\rho g}} \;=\; H_{\mathrm{rms}},
+\label{eq:Hrms}
+\end{equation}
+so the $H$ carried internally by SnapWave is the \emph{root-mean-square} wave
+height. When coupling back to SFINCS and to the boundary input, the code
+converts with $H_{m0}=\sqrt{2}\,H_{\mathrm{rms}}$
+(\code{sfincs\_snapwave.f90}: \code{hm0 = snapwave\_H * sqrt(2.0)}).
+
+Equation~\eqref{eq:energybalance} is the energy form of the wave-action
+balance: because frequency is \emph{not} a coordinate and no current field is
+applied in SnapWave, action conservation reduces to energy conservation and the
+balance is written in energy form directly. This is a fundamental simplification
+relative to SWAN-type models (Section~\ref{sec:comparison}).
+
+An identical equation with IG coefficients ($c_{g,ig}$, $c_{\theta,ig}$,
+$D_{w,ig}$, $D_{f,ig}$) is solved for $E_{\theta,ig}$, with the sign of the
+exchange term reversed: the term acts as a \emph{sink} for incident energy and a
+\emph{source} for IG energy (scaled by \code{snapwave\_shinc2ig}, default 1.0).
+
+\subsection{Linear wave kinematics}
+
+The dispersion relation is evaluated with Eckart's (1952) explicit
+approximation (\code{snapwave\_windsource.f90::disper\_approx\_1}):
+\begin{equation}
+k=\frac{\sigma^{2}}{g}
+\left[1-\exp\!\left(-\left(\sigma\sqrt{h/g}\right)^{2.5}\right)\right]^{-0.4},
+\qquad
+c=\frac{\sigma}{k},\qquad
+n=\tfrac{1}{2}+\frac{kh}{\sinh(2kh)},\qquad
+c_g=n\,c .
+\label{eq:dispersion}
+\end{equation}
+The refraction speed follows from linear ray theory for a depth-varying,
+current-free medium:
+\begin{equation}
+c_\theta(\theta)=
+\frac{\sigma}{\sinh(2kh)}
+\left(\frac{\partial h}{\partial x}\sin\theta-\frac{\partial h}{\partial y}\cos\theta\right),
+\qquad
+|c_\theta|\le \frac{\sigma}{4},
+\label{eq:ctheta}
+\end{equation}
+where the limiter (one quarter turn per wave period) prevents unrealistic
+turning rates over steep bathymetry. Note that $\partial h/\partial x$ is
+evaluated from the \emph{bed} gradient field computed once from $z_b$ at
+initialisation (\code{snapwave\_domain.f90::fm\_surrounding\_points}), while
+$h$ itself varies in time with the SFINCS water level. There is \textbf{no
+refraction by currents}: ambient currents $\mathbf{u}$ from SFINCS are not
+passed to the ray equations.
+
+
+\section{Boundary conditions and directional spectra}
+\label{sec:boundaries}
+
+Offshore input consists of bulk parameters $H_{m0}$, $T_p$, mean direction
+$\bar\theta_w$ (nautical, coming-from, degrees) and directional spreading
+$\sigma_\theta$ (degrees) at one or more support points
+(\code{snapwave\_boundaries.f90}). At each support point the total energy is set
+from the significant height,
+\begin{equation}
+E_0=\frac{1}{16}\rho g H_{m0}^{2},
+\end{equation}
+and distributed over directions with a wrapped power-of-cosine distribution
+centred on the mean wave direction:
+\begin{equation}
+\ee(\theta)\propto
+\begin{cases}
+\operatorname{sgn}(\cos(\theta-\bar\theta))\,
+|\cos(\theta-\bar\theta)|^{m_s},
+& |\theta-\bar\theta|\lesssim \pi/2,\\[2pt]
+0, & \text{otherwise},
+\end{cases}
+\qquad m_s=\frac{1}{\sigma_\theta^{2}}-1 .
+\label{eq:cosn}
+\end{equation}
+Grid boundary cells receive spectra by inverse-distance weighting of the two
+nearest support points. On lateral (Neumann) boundaries all wave properties are
+copied from the adjacent inner cell. The directional grid $\{\theta_j\}$ is
+rebuilt \emph{at every SnapWave call} around the current energy-weighted mean
+wave (or wind) direction (\code{make\_theta\_grid}), so the directional window
+moves in time; the sector width is \code{snapwave\_sector} (default
+$180^\circ$) with resolution \code{snapwave\_dtheta} (default $10^\circ$).
+
+\section{Dissipation and source terms}
+\label{sec:sources}
+
+\subsection{Depth-induced breaking (Baldock et al., 1998)}
+
+Breaking dissipation (\code{snapwave\_solver.f90::baldock}) is
+\begin{equation}
+D_w=\frac{0.28\,\alpha\,\rho g}{T}\,
+\exp\!\left[-\left(\frac{H_{\max}}{H}\right)^{2}\right]
+\left(H_{\max}^{2}+H^{2}\right)\,f ,
+\qquad
+f=\left(\frac{H}{H_{\max}}\right)^{i_{\exp}}\ \text{if } H>H_{\max},
+\label{eq:baldock}
+\end{equation}
+with $H_{\max}=\gamma h$ for incident waves ($\gamma$ =
+\code{snapwave\_gamma}, default 0.7; $\alpha$ = \code{snapwave\_alpha},
+default 1.0), and the Battjes--Janssen-type limiter
+$H_{\max,ig}=(0.88/k_{ig})\tanh(\gamma_{ig} k_{ig} h/0.88)$ for IG waves. The
+extra factor $f$ (exponent \code{snapwave\_baldock\_exponent}, default 2) adds
+dissipation on steep coasts where Baldock's form cannot keep up with shoaling.
+Breaking is only evaluated when $H>$~\code{snapwave\_baldock\_ratio}~$\times
+H_{\max}$ (default ratio 0.2).
+
+\subsection{Bottom friction}
+
+For incident waves, a quadratic friction law with the near-bed orbital velocity
+amplitude gives
+\begin{equation}
+D_f=0.28\,\rho\, f_w\, u_{orb}^{3},
+\qquad
+u_{orb}=\frac{\sigma H}{2\sinh(kh)},
+\end{equation}
+with $f_w$ = \code{snapwave\_fw} (default 0.01). For IG waves the code uses a
+formulation proportional to the incident wave height
+(\code{Df\_ig} in \code{solve\_energy\_balance2Dstat}):
+\begin{equation}
+D_{f,ig}=0.0361\,f_{w,ig}\left(\frac{g}{h}\right)^{3/2} H_{\mathrm{inc}}\,E_{ig},
+\qquad f_{w,ig}=\code{snapwave\_fwig}\ (0.015).
+\end{equation}
+
+\subsection{Vegetation}
+
+With \code{vegetation=1}, wave dissipation by vegetation $D_{veg}$ follows the
+layered Suzuki et al.\ (2012) formulation with a Keulegan--Carpenter-number bulk
+drag coefficient (adapted from XBeach; \code{vegatt}, \code{swvegatt},
+\code{bulkdragcoeff}), using vertically segmented stem height $a_h$, diameter
+$b_v$, density $N$ and drag $C_D$ from \code{vegetationfile}. An additional
+direct wave-drag force on the mean flow, $F_{vw}$, is computed from a
+nonlinear (skewed/asymmetric) wave-shape velocity model (\code{swvegnonlin},
+\code{momeqveg}).
+
+\subsection{Depth limiter}
+
+After every node solve, energy exceeding the depth limit is removed by uniform
+directional scaling:
+\begin{equation}
+\ee \leftarrow \ee \Big/
+\max\!\left[1,\;
+\left(\frac{\sqrt{E/\left(\tfrac18\rho g\right)}}{\gamma_{\max} h}\right)^{2}
+\right],
+\qquad \gamma_{\max}=\code{snapwave\_gammax}\ (\text{default } 999).
+\label{eq:depthlimit}
+\end{equation}
+This is a hard limiter distinct from the Baldock term; with the default
+$\gamma_{\max}=999$ it is effectively inactive unless set by the user.
+
+
+\section{Infragravity wave generation and propagation}
+\label{sec:ig}
+
+\subsection{Boundary condition: Herbers et al.\ (1994) bound-wave spectrum}
+
+If \code{snapwave\_use\_herbers=1} (default), the offshore IG boundary
+condition is computed from the incident sea state: a JONSWAP frequency spectrum
+(peak enhancement $\gamma_J$ = \code{snapwave\_jonswapgamma}, default 3.3) is
+built from $H_{m0}$, $T_p$ and spreading, and the bound long-wave energy is
+computed from the bispectrum-based closure of Herbers et al.\ (1994), following
+the XBeach implementation (\code{snapwave\_infragravity.f90::compute\_herbers}).
+The IG period at the boundary is chosen from the reconstructed IG spectrum by
+\code{snapwave\_tpig\_opt} (1=$T_{m01}$, default). Stability guards in
+\code{determine\_ig\_bc}: if $H_{m0}/h>0.5$ at the support point the depth is
+reset to $2H_{m0}$; depths are capped at 200\,m. With
+\code{snapwave\_use\_herbers=0}, the older parameterisation
+$E_{ig,0}=\code{snapwave\_eeinc2ig}\times E_{inc}$ (default ratio 0.01) and
+$T_{ig}= \code{snapwave\_Tinc2ig}\times T_p$ (default 7) is used instead.
+
+\subsection{Inshore IG source: release of the bound long wave}
+
+Along the propagation path, IG energy is generated from the shoaling of the
+incident-wave radiation stress following Leijnse et al.\ (2024)
+(\code{determine\_infragravity\_source\_sink\_term}). Per direction the source
+inserted into the IG right-hand side is
+\begin{equation}
+S_{ig}(\theta)=
+\alpha_{ig}\,
+\frac{\sqrt{E_{ig}^{\,\uparrow}}\; c_g^{\,\uparrow}}{h^{\uparrow}}\,
+\frac{\max(\Delta S_{xx},0)}{\Delta s}\,
+\frac{\ee(\theta,k)}{E(k)},
+\label{eq:srcig}
+\end{equation}
+where $\uparrow$ denotes upwind-interpolated values. For
+\code{snapwave\_ig\_opt=1} (default), $\Delta S_{xx}$ uses a conservative
+shoaling estimate,
+\begin{equation}
+S_{xx}^{\mathrm{cons}}=
+E^{\uparrow}\,\frac{c_g^{\,\uparrow}}{c_{g,ig}(k)}\,
+\bigl(2n(k)-\tfrac12\bigr),
+\end{equation}
+relative to its upwind value; \code{ig\_opt=2} takes the raw difference. The
+efficiency factor $\alpha_{ig}$ is an empirical function of local bed slope
+$\beta$ and $\gamma_{\mathrm{loc}}=H_{\mathrm{rms}}/h$
+(\code{estimate\_shoaling\_parameter\_alphaig}, fit constants as in the code),
+limited to $[0,1]$ and scaled by \code{snapwave\_alphaigfac} (default 1.0). The
+source is smoothly switched off once incident waves break significantly,
+$\gamma_{\mathrm{loc}} >$ \code{snapwave\_gamma\_fac\_br}~$\times\,\gamma$
+(default 0.45), via logistic transition factors; beyond that point IG waves are
+treated as free. The same fraction \code{snapwave\_shinc2ig} of the source is
+subtracted from the incident balance (default: all of it).
+
+\section{Wind input and variable wave period}
+\label{sec:wind}
+
+With \code{snapwave\_wind=1}, a coupled \emph{wave-action} balance
+$A=\ee/\sigma$ is solved alongside Eq.~\eqref{eq:energybalance}, allowing the
+representative period to evolve: after each node solve,
+$\sigma=\operatorname{minmax}(E/A,\,\sigma_{\min},\,\sigma_{\max})$
+(\code{snapwave\_sigmin}, \code{snapwave\_sigmax} bound $\sigma$ to
+$[2\pi/25,\,2\pi/1]$\,rad\,s$^{-1}$ by default). Wind input follows the
+dimensionless growth curves of Breugem and Holthuijzen (2007) in
+Kahma--Calkoen form, capped by fully developed (Pierson--Moskowitz) and
+depth-limited sea states, and distributed over directions with
+\code{windspreadfac} (\code{snapwave\_windsource.f90::windinput}).
+Dissipation in the action equation uses the same fractional rate as the energy
+equation, with a $T$-dependent correction (\code{DwT}, \code{DwAk} terms).
+
+
+\section{Wave forces and the two-way coupling with SFINCS}
+\label{sec:coupling}
+
+\subsection{Dissipation-based wave force}
+
+SnapWave does \emph{not} evaluate the full radiation-stress tensor gradient
+$-\partial S_{ij}/\partial x_j$. Instead, the wave force per unit mass applied
+to the water column is computed from the local dissipation
+(\code{solve\_energy\_balance2Dstat}, final loop):
+\begin{equation}
+F(k)=\underbrace{\frac{D_w(k)\,k}{\sigma\,\rho\, h}}_{\approx\, D_w/(\rho h c)}
+\;+\;\underbrace{\frac{D_{veg}(k)\,k}{\sigma\,\rho\, h}}_{\text{vegetation dissipation}}
+\;+\;\underbrace{F_{vw}(k)}_{\substack{\text{direct wave drag}\\\text{from vegetation}}},
+\qquad [\mathrm{m\,s^{-2}}],
+\label{eq:force}
+\end{equation}
+i.e.\ the force is approximated as dissipation divided by (density $\times$
+depth $\times$ phase speed), directed along the local energy-weighted mean
+direction $\bar\theta(k)=\operatorname{atan2}(\sum\ee\sin\theta,\sum\ee\cos\theta)$.
+This is the usual ``$D/c$'' closure used in stationary surf-zone models; it
+assumes that the divergence of the radiation-stress field is locally balanced
+by dissipation, which is a reasonable approximation in breaking-dominated surf
+zones but not in shoaling or reflecting regions where $\nabla\!\cdot\!\mathbf{F}_{rad}$
+is set by wave--wave interaction and geometry rather than by $D$.
+
+\subsection{Transfer to the momentum equation}
+
+In \code{sfincs\_snapwave.f90::compute\_snapwave}, the force is converted to a
+depth-integrated form $\mathbf{F}\rho h$ (units N\,m$^{-2}$), mapped from the
+SnapWave mesh to the two SFINCS cells adjacent to each $u/v$ face, averaged,
+rotated into grid coordinates, divided by $\rho_w$ and added as an acceleration
+\code{fwuv} in \code{sfincs\_momentum.f90}:
+\begin{equation}
+\left.\frac{\partial q}{\partial t}\right|_{\mathrm{waves}}
+=\phi\;\operatorname{sgn}\!\bigl(\mathrm{fwuv}\bigr)\,
+\min\!\left(|\mathrm{fwuv}|,\;F_{\max}\right),
+\qquad
+F_{\max}=\underbrace{\frac{0.25\sqrt{g}\,\gamma_{\max}^{2}}{T_{p,\mathrm{mean}}}}_{\code{snapwave\_fwmaxfac}/\rho}\,h_{w}^{3/2},
+\label{eq:limiter}
+\end{equation}
+where $\phi$ is the subgrid wet fraction, $h_w$ the local wet depth at the
+velocity point, and the cap follows from the depth-limited setup scaling noted
+in \code{sfincs\_momentum.f90}
+(\code{fwmax = fwmaxfac * hwet * sqrt(hwet)}). Because the default
+\code{snapwave\_gammax} is 999, this limiter is effectively \emph{inactive}
+unless the user lowers $\gamma_{\max}$; if it is set, the cap grows as
+$h_w^{3/2}$ and shrinks with the mean boundary period. The whole force can be scaled by
+\code{snapwave\_waveforces\_ratio} (default 1.0; set to 0 to switch off the
+incident-wave setup when it is imposed elsewhere, e.g.\ a wavemaker).
+
+The reverse coupling is the depth field: SnapWave recomputes
+$h=\max(\zeta_{SFINCS}-z_b,10^{-5})$ at every call, so tide, surge and setup
+feed back on wave celerities, breaking and the Herbers IG boundary condition.
+Wave-enhanced bed roughness (\code{wave\_enhanced\_roughness}) can additionally
+feed $u_{orb}$ back into the SFINCS friction term via the BMI.
+
+\subsection{Stationarity and update interval}
+
+SFINCS updates the wave field every \code{dtwave} seconds (default 3600\,s);
+between updates the force field is frozen while the hydrodynamics evolve. The
+model therefore assumes that the wave field adapts instantaneously to the water
+depth and boundary conditions at each update: there is no wave-memory or
+propagation time lag. For domains whose offshore-to-coast travel time
+($\sim L/c_g$) is comparable to or larger than \code{dtwave}, or for rapidly
+varying storm forcing, this is a structural approximation to be aware of.
+
+\section{Numerical method}
+\label{sec:numerics}
+
+Equation~\eqref{eq:energybalance} is solved on an unstructured node mesh with a
+locally implicit scheme in $\theta$ and an upwind scheme in space:
+
+\begin{enumerate}
+  \item \textbf{Upwind characteristic interpolation.} For each node $k$ and
+  direction $\theta_j$, the backward characteristic intersects an edge between
+  two surrounding nodes $k_1,k_2$; values are linearly interpolated with weights
+  $w_1,w_2$ and distance $\Delta s$ (\code{snapwave\_domain.f90::find\_upwind\_neighbours},
+  \code{intersect\_angle}). Spherical geometry is supported via local
+  equirectangular scaling.
+  \item \textbf{Directional discretisation.} The refraction term uses central
+  differences in $\theta$ for interior bins and first-order upwind at the two
+  ends of the directional window, giving a tridiagonal system per node:
+  \begin{equation}
+  A_j=-\frac{c_{\theta,j-1}}{2\Delta\theta},\quad
+  B_j=\frac{1}{\dd t^{*}}+\frac{c_g}{\Delta s}+\frac{D_{tot}}{E},\quad
+  C_j=\frac{c_{\theta,j+1}}{2\Delta\theta},\quad
+  R_j=\frac{\ee^{\mathrm{old}}_j}{\dd t^{*}}
+      +\frac{c_g^{\uparrow}\ee^{\uparrow}_j}{\Delta s}
+      -S_{ig,j}\,\code{shinc2ig}.
+  \label{eq:tridiag}
+  \end{equation}
+  \item \textbf{Sweeping iteration.} Nodes are visited in four sweep orders
+  aligned with $\bar\theta + m\pi/2$ (Gauss--Seidel-like), with the pseudo-time
+  term $1/\dd t^{*}$ (\code{snapwave\_dt}, default 36000\,s) acting as
+  under-relaxation. Convergence is checked every fourth sweep:
+  $\max_k|\ee-\ee^{\mathrm{old}}|/\max \ee <$ \code{snapwave\_crit} (default
+  $10^{-3}$), with at most \code{snapwave\_niter} (default 10) four-sweep
+  cycles. Fractional dissipation $D_{tot}/E$ is under-relaxed with factor
+  \code{snapwave\_relax\_factor\_DoverE} (default 0.25).
+  \item \textbf{Sequential splitting.} Within one call the incident balance,
+  optional action balance, and IG balance are solved sequentially per node, with
+  the IG source computed either once per four sweeps (default,
+  \code{snapwave\_iterative\_srcig=0}) or every sweep.
+\end{enumerate}
+
+Energy from the previous call is retained as the initial guess (\code{restart}),
+which speeds up convergence between slowly varying updates but also means the
+solution carries a weak dependence on the previous wave state.
+
+
+\section{Comparison with Boussinesq and spectral wave models}
+\label{sec:comparison}
+
+\subsection{Position in model hierarchy}
+
+\begin{table}[h!]
+\centering
+\small
+\caption{Conceptual comparison of wave-modelling approaches.}
+\label{tab:comparison}
+\begin{tabular}{@{}p{2.8cm}p{3.9cm}p{4.0cm}p{3.6cm}@{}}
+\toprule
+ & \textbf{SnapWave (this code)} & \textbf{Spectral (SWAN, XBeach stationary)} & \textbf{Boussinesq / non-hydrostatic} \\
+\midrule
+Wave field & $\ee(\theta)$ at one $\sigma$ per system (incident + IG) & $N(\sigma,\theta)$, full frequency--direction spectrum & Free surface $\eta(x,y,t)$, phase-resolving \\
+Time dependence & Stationary + pseudo-time iteration & Stationary or non-stationary & Fully time-dependent \\
+Dispersion & Linear, Eckart approximation & Linear (exact root of $\sigma^2=gk\tanh kh$) & Weakly/fully dispersive (finite-depth terms) \\
+Nonlinearity & None in propagation; empirical breaking/IG closures & Quadruplet/triad interactions (optional) & Nonlinear advection and amplitude dispersion \\
+Refraction by currents & Not included & Included (action balance) & Intrinsic \\
+Diffraction & Not included & Optional phase-decoy / mild-slope variants & Intrinsic (model dependent) \\
+Breaking & Baldock et al.\ (1998) & Battjes--Janssen (1978) or saturation models & Emergent (with breaking closures) \\
+IG waves & Separate balance, Leijnse et al.\ (2024) source, Herbers BC & Parameterised or not present & Emergent from bound-wave release \\
+Wave force & $D/c$-type dissipation closure, Eq.~\eqref{eq:force} & Radiation-stress gradients $-\partial_j S_{ij}$ & Emergent from resolved flow \\
+Typical cost & Very low (flood-model compatible) & Moderate & High (event-scale only) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Key differences from a SWAN-type spectral model}
+
+\begin{enumerate}
+  \item \textbf{No frequency dimension.} SnapWave carries one representative
+  frequency per wave system; spectral shape is only imposed at the boundary
+  (JONSWAP) for the Herbers IG computation. Frequency shifting by currents,
+  quadruplet/triad energy transfer and whitecapping are absent. The optional
+  action balance changes the \emph{representative} period with wind growth but
+  does not create a spectrum.
+  \item \textbf{Energy rather than action.} With no ambient currents, energy and
+  action balances are equivalent; the difference matters exactly where
+  current--wave interaction is important (tidal inlets, river plumes, strong
+  alongshore currents). SnapWave will not refract or steepen waves on a current
+  field, even though SFINCS computes that current field.
+  \item \textbf{Stationarity.} SWAN's non-stationary mode integrates
+  $\partial N/\partial t$ physically; SnapWave's $\partial/\partial t^{*}$ is
+  only an iteration device. Hysteresis of the wave field (e.g.\ swell arriving
+  before local seas) cannot be represented.
+  \item \textbf{Wave forcing closure.} SWAN/XBeach feed
+  $-\nabla\!\cdot\!\mathbf{S}$ to the flow; SnapWave applies the dissipation
+  closure Eq.~\eqref{eq:force}, plus a limiter Eq.~\eqref{eq:limiter}. Setup in
+  non-breaking (shoaling) zones and set-down offshore of the breakpoint are
+  therefore only crudely represented.
+\end{enumerate}
+
+\subsection{Key differences from Boussinesq-type models}
+
+Boussinesq and non-hydrostatic models resolve the phase of the free surface and
+retain frequency dispersion through depth-integrated but dispersive momentum
+equations. Consequently they generate bound and free infragravity waves, wave
+groups, runup and swash \emph{dynamically}, and their momentum forcing is
+exactly the resolved wave-averaged flow. SnapWave replaces all of this with
+phase-averaged balances and empirical closures (Baldock breaking, Herbers IG
+boundary, Leijnse et al.\ IG source). The gain is orders-of-magnitude speed;
+the cost is the loss of phase information, wave--wave interaction, harmonic
+structure of runup, and reflection (except through the weakly reflective SFINCS
+boundary treatment). Note that SFINCS itself also offers a non-hydrostatic
+correction (\code{nonh}) and wavemakers; those are alternative, more
+phase-resolving routes within the same model, outside SnapWave.
+
+
+\subsection{Practical implications for coupled simulations}
+\label{sec:implications}
+
+Points most relevant when the coupled wave--hydrodynamic results look wrong:
+
+\begin{enumerate}
+  \item \textbf{Check where the force comes from.} Because
+  Eq.~\eqref{eq:force} is dissipation-driven, wave setup is concentrated where
+  $D_w$ (breaking) is large. If your case has little breaking at the boundary
+  depth, or breaking is suppressed by $\gamma$/\code{baldock\_ratio} settings,
+  the setup will be small regardless of offshore $H_{m0}$.
+  \item \textbf{Check the limiter.} The piecewise force cap
+  Eq.~\eqref{eq:limiter} is inactive by default ($\gamma_{\max}=999$), but if
+  you have lowered $\gamma_{\max}$ it can clip forces strongly for short $T_p$
+  or shallow depths; inspect \code{fwmaxfac} if forces look saturated.
+  \item \textbf{Check the moving directional window.} The $\theta$-grid is
+  re-centred on the energy-weighted mean direction at every call; rapid turning
+  of offshore direction between calls can produce abrupt force changes.
+  \item \textbf{Check the update interval.} Set \code{dtwave} small enough to
+  resolve the surge/tide variation that feeds $h$; recall the wave field is
+  frozen between updates.
+  \item \textbf{Check depth feedback at boundaries.} The Herbers IG boundary
+  uses the \emph{time-varying} depth at the support point
+  (\code{find\_nearest\_depth\_for\_boundary\_points}); shallow support points
+  ($H_{m0}/h>0.5$) trigger the depth-reset guard and change the IG forcing.
+  \item \textbf{Check double counting.} If incident setup is imposed through a
+  wavemaker or through the water-level boundary, set
+  \code{snapwave\_waveforces\_ratio=0}.
+  \item \textbf{Check IG choices.} Compare \code{snapwave\_use\_herbers=1}
+  versus 0, \code{snapwave\_ig\_opt=1} versus 2, and
+  \code{snapwave\_iterative\_srcig=0} versus 1; the IG source is evaluated from
+  the previous sweep/call state, so sensitivities are expected.
+  \item \textbf{Check currents.} If wave--current interaction is physically
+  important at your site, SnapWave will not represent it; this is a model
+  limitation, not a bug.
+  \item \textbf{Check convergence.} The log reports \code{error}, \code{\%ok}
+  (and IG equivalents) per call; non-converged wave fields
+  (\code{ended at iteration ...}) produce inconsistent forces.
+\end{enumerate}
+
+\section{Code--equation cross-reference}
+
+\begin{table}[h!]
+\centering
+\small
+\caption{Mapping of equations to source locations.}
+\label{tab:map}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Equation / term & Symbol & Source location \\
+\midrule
+Energy balance \eqref{eq:energybalance} & $\ee$, $E_{\theta,ig}$ & \code{solve\_energy\_balance2Dstat} (\code{snapwave\_solver.f90}) \\
+Dispersion \eqref{eq:dispersion} & $k,c_g$ & \code{disper\_approx\_1} (\code{snapwave\_windsource.f90}) \\
+Refraction \eqref{eq:ctheta} & $c_\theta$ & \code{compute\_celerities} (idem) \\
+Directional spectrum \eqref{eq:cosn} & $m_s$ & \code{update\_boundary\_points} (\code{snapwave\_boundaries.f90}) \\
+Breaking \eqref{eq:baldock} & $D_w$ & \code{baldock} (\code{snapwave\_solver.f90}) \\
+IG source \eqref{eq:srcig} & $S_{ig}$ & \code{determine\_infragravity\_source\_sink\_term} \\
+IG boundary & $H_{m0,ig}$ & \code{compute\_herbers} (\code{snapwave\_infragravity.f90}) \\
+Wind input & $S_{wind}$ & \code{windinput} (\code{snapwave\_windsource.f90}) \\
+Wave force \eqref{eq:force} & $F$ & final loop of \code{solve\_energy\_balance2Dstat} \\
+Force limiter \eqref{eq:limiter} & \code{fwmaxfac} & \code{compute\_snapwave} (\code{sfincs\_snapwave.f90}) \\
+Momentum coupling & \code{fwuv} & \code{update\_wave\_field}, \code{sfincs\_momentum.f90} \\
+Upwind/tridiagonal \eqref{eq:tridiag} & $A,B,C,R$ & \code{find\_upwind\_neighbours}, \code{solve\_tridiag} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{References}
+\begin{itemize}
+  \item Baldock, T.E., Holmes, P., Bunker, S., van Weert, P. (1998).
+  Cross-shore hydrodynamics within an unsaturated surf zone. \emph{Coastal
+  Engineering} 34, 173--196.
+  \item Battjes, J.A., Janssen, J.P.F.M. (1978). Energy loss and set-up due to
+  breaking of random waves. \emph{Proc.\ 16th ICCE}.
+  \item Breugem, W.A., Holthuijsen, L.H. (2007). Generalized shallow-water wave
+  growth from Lake George. \emph{J.\ Waterway, Port, Coastal, Ocean Eng.}
+  \item Herbers, T.H.C., Elgar, S., Guza, R.T. (1994). Infragravity-frequency
+  (0.005--0.05 Hz) motions on the shelf. Part I. \emph{J.\ Phys.\ Oceanogr.} 24.
+  \item Leijnse, T., van Ormondt, M., Nederhoff, K., van Dongeren, A. (2021).
+  Modeling compound flooding in coastal systems using a computationally
+  efficient reduced-physics solver. \emph{Coastal Engineering} 163, 103796.
+  \item Leijnse, T.\ et al.\ (2024). Estimating nearshore infragravity wave
+  conditions at large spatial scales. \emph{Front.\ Mar.\ Sci.} 11:1355095.
+  \item Suzuki, T., Zijlema, M., Burger, B., Meijer, M.C., Narayan, S. (2012).
+  Wave dissipation by vegetation with layered schematization in SWAN.
+  \emph{Coastal Engineering} 59, 64--71.
+  \item Booij, N., Ris, R.C., Holthuijsen, L.H. (1999). A third-generation wave
+  model for coastal regions (SWAN). \emph{J.\ Geophys.\ Res.} 104(C4).
+  \item Eckart, C. (1952). The propagation of gravity waves from deep to shallow
+  water. \emph{Gravity Waves}, NBS Circular 521.
+\end{itemize}
+
+\end{document}
+
